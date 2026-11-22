@@ -1,0 +1,11 @@
+name: diag
+on:
+  push:
+    paths:
+      - '.github/workflows/diag.yml'
+  workflow_dispatch:
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo diag-ok
