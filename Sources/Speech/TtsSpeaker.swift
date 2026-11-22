@@ -53,8 +53,8 @@ private final class SynthesisContext {
         lock.unlock()
     }
 
-    func push(_ buffer: AVAudioPCMBuffer?) {
-        guard let buffer else { return }
+    func push(_ rawBuffer: AVAudioBuffer?) {
+        guard let rawBuffer, let buffer = rawBuffer as? AVAudioPCMBuffer else { return }
         if buffer.frameLength == 0 {
             finish()
             return
