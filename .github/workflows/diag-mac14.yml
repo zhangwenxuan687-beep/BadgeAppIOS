@@ -1,0 +1,11 @@
+name: diag-mac14
+on:
+  push:
+    paths:
+      - '.github/workflows/diag-mac14.yml'
+  workflow_dispatch:
+jobs:
+  diag:
+    runs-on: macos-14
+    steps:
+      - run: sw_vers
