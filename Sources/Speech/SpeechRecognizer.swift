@@ -21,6 +21,8 @@ final class SpeechRecognizer {
     private var latest = ""
     private var finished = true
     private var finishContinuation: CheckedContinuation<String, Never>?
+    /// 自适应增益：上行 4bit ADPCM 解码后电平常偏低，按帧 RMS 平滑提增益
+    private var agcGain: Float = 1.0
 
     var onDeviceAvailable: Bool {
         recognizer?.supportsOnDeviceRecognition ?? false
@@ -52,6 +54,7 @@ final class SpeechRecognizer {
         latest = ""
         finished = false
         finishContinuation = nil
+        agcGain = 1.0
         lock.unlock()
 
         request = req
@@ -74,9 +77,18 @@ final class SpeechRecognizer {
               let buffer = AVAudioPCMBuffer(pcmFormat: format,
                                             frameCapacity: AVAudioFrameCount(pcm.count)) else { return }
         buffer.frameLength = AVAudioFrameCount(pcm.count)
+
+        // 帧级 RMS -> 目标电平 0.12，增益 1~6 倍，0.8/0.2 平滑避免抽吸
+        var energy: Double = 0
+        for s in pcm { let v = Double(s) / 32768.0; energy += v * v }
+        let rms = Float((energy / Double(pcm.count)).squareRoot())
+        let want: Float = rms > 0.0005 ? min(max(0.12 / rms, 1.0), 6.0) : agcGain
+        agcGain = agcGain * 0.8 + want * 0.2
+        let gain = agcGain
+
         if let channel = buffer.floatChannelData?[0] {
             for i in 0..<pcm.count {
-                channel[i] = Float(pcm[i]) / 32768.0
+                channel[i] = max(-1, min(1, Float(pcm[i]) / 32768.0 * gain))
             }
         }
         req.append(buffer)
@@ -85,6 +97,16 @@ final class SpeechRecognizer {
     /// 结束拾音并等待最终识别文本（最多 4 秒兜底）
     func finish() async -> String {
         guard let req = request else { return "" }
+
+        // 末尾补 300ms 静音：给识别器收尾时间，明显减少「最后几个字被吞」
+        let silenceFrames = AVAudioFrameCount(Double(BadgeProtocol.sampleRate) * 0.3)
+        if let silence = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: silenceFrames) {
+            silence.frameLength = silenceFrames
+            if let ch = silence.floatChannelData?[0] {
+                for i in 0..<Int(silenceFrames) { ch[i] = 0 }
+            }
+            req.append(silence)
+        }
         req.endAudio()
 
         let text = await withCheckedContinuation { (continuation: CheckedContinuation<String, Never>) in

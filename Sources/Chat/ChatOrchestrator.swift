@@ -279,10 +279,11 @@ final class ChatOrchestrator: ObservableObject {
             ble.sendTtsData(adpcm)
             offset += BadgeProtocol.frameSamples
             sent += 1
-            // 按播放速率限速：先给前 10 帧（200ms）缓冲，之后 20ms/帧，
-            // 避免合成速度快于蓝牙发送导致写队列积压丢包（挂件播报中途断掉）
-            if sent > 10 {
-                try? await Task.sleep(nanoseconds: 20_000_000)
+            // 先给 25 帧（500ms）预缓冲，之后按 2 倍速（10ms/帧）发送：
+            // 固件播放队列有 1MB 缓冲，发送略快于播放才能扛住 BLE 调度抖动，
+            // 否则任何一点延迟都会让播放队列饿死（喇叭断断续续）
+            if sent > 25 {
+                try? await Task.sleep(nanoseconds: 10_000_000)
             }
         }
     }
