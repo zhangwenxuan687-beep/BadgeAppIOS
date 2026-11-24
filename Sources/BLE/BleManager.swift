@@ -153,6 +153,16 @@ final class BleManager: NSObject, ObservableObject {
         enqueue(ch, Data([op]), .withoutResponse)
     }
 
+    /// 尚未发出的写包数量（TTS 背压用）
+    var pendingWrites: Int { writeQueue.count }
+
+    /// 丢弃还没发出去的下行音频：新一轮 TTS 开始时调用，
+    /// 否则上一轮积压的残包会排在本轮 BEGIN 之前，污染开头
+    func clearAudioWrites() {
+        guard let down = characteristics[BadgeProtocol.audDown] else { return }
+        writeQueue.removeAll { $0.characteristic === down && $0.type == .withoutResponse }
+    }
+
     private func enqueue(_ characteristic: CBCharacteristic, _ data: Data,
                          _ type: CBCharacteristicWriteType) {
         guard state == .connected else { return }

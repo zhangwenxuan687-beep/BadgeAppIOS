@@ -33,8 +33,13 @@ final class ChatOrchestrator: ObservableObject {
     private var turnTask: Task<Void, Never>?
     private var turnAbort = false
     private var pendingText = ""
+    /// 切好的句子先进队列，由独立消费者合成/下发，
+    /// 这样 LLM 增量可以立刻刷新界面（否则合成会把流读卡成一句一顿）
+    private var sentenceSink: AsyncStream<String>.Continuation?
     private var speechAuthorized = false
     private var finishingSpeech = false
+    /// 诊断用：本轮第一句 TTS 的「开头 0.5s RMS / 整句 RMS」
+    private var ttsDiag = ""
     private var notice: String?
     private var cancellables = Set<AnyCancellable>()
 
@@ -130,6 +135,8 @@ final class ChatOrchestrator: ObservableObject {
 
     func abortTurn(_ reason: String) {
         turnAbort = true
+        sentenceSink?.finish()
+        sentenceSink = nil
         turnTask?.cancel()
         turnTask = nil
         ble.sendCmd("AUDIO_FLUSH")
@@ -159,6 +166,7 @@ final class ChatOrchestrator: ObservableObject {
         busy = true
         turnAbort = false
         pendingText = ""
+        ttsDiag = ""
         notice = nil
         encoder.reset()
         tts.stop()
@@ -175,7 +183,21 @@ final class ChatOrchestrator: ObservableObject {
         let client = LlmClient(url: settings.llmUrl, model: settings.model)
         var first = true
 
+        // 新一轮开始：清掉上一轮没发完的音频残包，再发 BEGIN
+        ble.clearAudioWrites()
         ble.sendTtsBegin()
+
+        // 句子 -> 合成 -> 下发，独立任务串行消费
+        var captured: AsyncStream<String>.Continuation!
+        let sentences = AsyncStream<String> { captured = $0 }   // 构造闭包同步执行，必定赋值
+        let sink = captured
+        sentenceSink = sink
+        let ttsJob = Task { @MainActor [weak self] in
+            for await sentence in sentences {
+                guard let self, !self.turnAbort else { break }
+                await self.speak(sentence)
+            }
+        }
 
         do {
             for try await delta in client.stream(messages: messages) {
@@ -189,16 +211,24 @@ final class ChatOrchestrator: ObservableObject {
                 if let last = chatLog.indices.last {
                     chatLog[last].text = full
                 }
-                await feedSplitter(delta)
+                feedSplitter(delta)
             }
 
             if !turnAbort && !Task.isCancelled {
                 let tail = pendingText.trimmingCharacters(in: .whitespacesAndNewlines)
                 pendingText = ""
-                if !tail.isEmpty { await speak(tail) }
+                if !tail.isEmpty { sink.yield(tail) }
+                sink.finish()
+                sentenceSink = nil
+                await ttsJob.value
                 ble.sendTtsEnd()
+            } else {
+                sink.finish()
+                sentenceSink = nil
             }
         } catch {
+            sink.finish()
+            sentenceSink = nil
             if !turnAbort {
                 notice = "LLM错误: \(error.localizedDescription)"
             }
@@ -214,6 +244,7 @@ final class ChatOrchestrator: ObservableObject {
         let firstText = firstDeltaMs < 0 ? "-" : "\(firstDeltaMs)"
         let totalText = Int(Date().timeIntervalSince(started) * 1000)
         metrics = "首字 \(firstText)ms | 全轮 \(totalText)ms"
+        if !ttsDiag.isEmpty { metrics += " | \(ttsDiag)" }
         busy = false
         if !turnAbort { turnTask = nil }
         refreshPhase()
@@ -221,7 +252,7 @@ final class ChatOrchestrator: ObservableObject {
 
     /* ---------------- 切句 + TTS 下发 ---------------- */
 
-    private func feedSplitter(_ delta: String) async {
+    private func feedSplitter(_ delta: String) {
         pendingText += delta
 
         while !turnAbort && !Task.isCancelled {
@@ -229,7 +260,7 @@ final class ChatOrchestrator: ObservableObject {
                 let end = pendingText.index(after: index)
                 let sentence = String(pendingText[..<end])
                 pendingText = String(pendingText[end...])
-                await speak(sentence)
+                sentenceSink?.yield(sentence)
                 continue
             }
 
@@ -248,7 +279,7 @@ final class ChatOrchestrator: ObservableObject {
                 let end = cut ?? pendingText.index(pendingText.startIndex, offsetBy: 60)
                 let sentence = String(pendingText[..<end])
                 pendingText = String(pendingText[end...])
-                await speak(sentence)
+                sentenceSink?.yield(sentence)
                 continue
             }
             break
@@ -266,6 +297,20 @@ final class ChatOrchestrator: ObservableObject {
         let pcm = await tts.synthesize(cleaned)
         guard !pcm.isEmpty else { return }
 
+        // 诊断：本轮第一句的开头 0.5s 与整句 RMS，用来区分「是 TTS 源头就轻」
+        // 还是「挂件解码/播放侧变轻」
+        if ttsDiag.isEmpty {
+            func rms(_ slice: ArraySlice<Int16>) -> Double {
+                guard !slice.isEmpty else { return 0 }
+                var e = 0.0
+                for s in slice { let v = Double(s) / 32768.0; e += v * v }
+                return (e / Double(slice.count)).squareRoot()
+            }
+            let head = rms(pcm.prefix(8000))
+            let all = rms(pcm[...])
+            ttsDiag = String(format: "TTS头%.3f/整句%.3f", head, all)
+        }
+
         var offset = 0
         var sent = 0
         var frame = [Int16](repeating: 0, count: BadgeProtocol.frameSamples)
@@ -276,14 +321,20 @@ final class ChatOrchestrator: ObservableObject {
                 frame[i] = i < n ? pcm[offset + i] : 0    // 尾块补零
             }
             let adpcm = encoder.encode(frame)
+            // 背压：写队列积压超过 200 帧（约 4s）就暂停，宁可晚发也不丢包
+            // —— 之前固定 2 倍速把队列顶满后丢的是最后几帧，尾音就被吞了
+            var guardCount = 0
+            while ble.pendingWrites > 200 && !turnAbort && !Task.isCancelled && guardCount < 200 {
+                try? await Task.sleep(nanoseconds: 20_000_000)
+                guardCount += 1
+            }
             ble.sendTtsData(adpcm)
             offset += BadgeProtocol.frameSamples
             sent += 1
-            // 先给 25 帧（500ms）预缓冲，之后按 2 倍速（10ms/帧）发送：
-            // 固件播放队列有 1MB 缓冲，发送略快于播放才能扛住 BLE 调度抖动，
-            // 否则任何一点延迟都会让播放队列饿死（喇叭断断续续）
-            if sent > 25 {
-                try? await Task.sleep(nanoseconds: 10_000_000)
+            // 预缓冲 40 帧（800ms），之后 17ms/帧（约 1.18 倍速）：
+            // 略快于播放即可建立余量，又不至于把 BLE 写队列顶满
+            if sent > 40 {
+                try? await Task.sleep(nanoseconds: 17_000_000)
             }
         }
     }
