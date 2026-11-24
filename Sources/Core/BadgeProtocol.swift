@@ -31,7 +31,7 @@ enum BadgeProtocol {
     static let frameSamples = 320
     static let adpcmBytes = 160
 
-    /* 固件 GC0308：QQVGA 160x120 RGB565（小端），380 字节/行 */
+    /* 固件 GC0308：QQVGA 160x120 RGB565（大端），320 字节/行 */
     static let imageWidth = 160
     static let imageHeight = 120
 }

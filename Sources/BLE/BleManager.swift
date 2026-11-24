@@ -275,7 +275,7 @@ final class BleManager: NSObject, ObservableObject {
         return min(1.0, sqrt(acc / Double(pcm.count)) * 4.0)
     }
 
-    /// 固件图像有两种格式：真实帧为 160x120 RGB565 小端裸数据；故障注入测试图为 JPEG
+    /// 固件图像有两种格式：真实帧为 160x120 RGB565 **大端**裸数据；故障注入测试图为 JPEG
     private static func decodeImage(_ data: [UInt8]) -> UIImage? {
         if data.count >= 2, data[0] == 0xFF, data[1] == 0xD8 {
             return UIImage(data: Data(data))
@@ -292,10 +292,14 @@ final class BleManager: NSObject, ObservableObject {
         var si = 0
         var di = 0
         for _ in 0..<(width * height) {
-            let value = UInt16(data[si]) | (UInt16(data[si + 1]) << 8)
-            rgba[di] = UInt8((value >> 11) & 0x1F) << 3
-            rgba[di + 1] = UInt8((value >> 5) & 0x3F) << 2
-            rgba[di + 2] = UInt8(value & 0x1F) << 3
+            // esp32-camera 输出为大端字节序（与 PC 端控制台 dtype=">u2" 一致）
+            let value = (UInt16(data[si]) << 8) | UInt16(data[si + 1])
+            let r5 = UInt8((value >> 11) & 0x1F)
+            let g6 = UInt8((value >> 5) & 0x3F)
+            let b5 = UInt8(value & 0x1F)
+            rgba[di] = (r5 << 3) | (r5 >> 2)
+            rgba[di + 1] = (g6 << 2) | (g6 >> 4)
+            rgba[di + 2] = (b5 << 3) | (b5 >> 2)
             rgba[di + 3] = 255
             si += 2
             di += 4
