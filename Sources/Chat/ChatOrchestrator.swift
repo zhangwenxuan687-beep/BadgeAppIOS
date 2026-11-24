@@ -31,7 +31,10 @@ final class ChatOrchestrator: ObservableObject {
 
     private var history: [(String, String)] = []
     private var turnTask: Task<Void, Never>?
+    private var ttsTask: Task<Void, Never>?
     private var turnAbort = false
+    /// 轮次序号：语音打断后旧轮次的收尾代码不能覆盖新一轮状态
+    private var turnSeq = 0
     private var pendingText = ""
     /// 切好的句子先进队列，由独立消费者合成/下发，
     /// 这样 LLM 增量可以立刻刷新界面（否则合成会把流读卡成一句一顿）
@@ -40,15 +43,26 @@ final class ChatOrchestrator: ObservableObject {
     private var finishingSpeech = false
     /// 诊断用：本轮第一句 TTS 的「开头 0.5s RMS / 整句 RMS」
     private var ttsDiag = ""
+    /// 本轮音频起点，用来估算挂件已播到哪（做下发流量控制）
+    private var audioStartAt: Date?
+    /// 我们自己发的 AUDIO_FLUSH 会引来固件回 tpos，别当成用户打断
+    private var expectFlushAck = false
+    /// 语音打断：TTS 播放期间保持麦克风开启，检测到人声就打断
+    private var bargeEnabled = false
+    private var bargeBaselineSum = 0.0
+    private var bargeBaselineFrames = 0
+    private var bargeHit = 0
+    /// 语音打断后自动拾音，检测到尾静音就自动提交
+    private var autoListen = false
+    private var autoSpeechFrames = 0
+    private var autoSilenceFrames = 0
+    private var autoTotalFrames = 0
     private var notice: String?
     private var cancellables = Set<AnyCancellable>()
 
     private init() {
         ble.onMicPcm = { [weak self] pcm, _ in
-            Task { @MainActor in
-                guard let self, self.listening else { return }
-                self.speech.append(pcm)
-            }
+            Task { @MainActor in self?.handleMicFrame(pcm) }
         }
         ble.onStatus = { [weak self] object in
             Task { @MainActor in self?.handleStatus(object) }
@@ -105,7 +119,9 @@ final class ChatOrchestrator: ObservableObject {
         guard ble.isConnected, speechAuthorized, !listening, !busy, !finishingSpeech else { return }
         notice = nil
         turnAbort = false
+        bargeEnabled = false
         listening = true
+        autoListen = false
         phase = "拾音中…"
         speech.begin()
         ble.sendCmd("START_MIC")
@@ -114,6 +130,10 @@ final class ChatOrchestrator: ObservableObject {
     func stopMicAndChat() {
         guard listening else { return }
         listening = false
+        if autoListen {           // 语音打断后手动结束：旧轮次已停，清掉打断标记
+            autoListen = false
+            turnAbort = false
+        }
         finishingSpeech = true
         phase = "识别中…"
         ble.sendCmd("STOP_MIC")
@@ -135,10 +155,15 @@ final class ChatOrchestrator: ObservableObject {
 
     func abortTurn(_ reason: String) {
         turnAbort = true
+        bargeEnabled = false
+        autoListen = false
         sentenceSink?.finish()
         sentenceSink = nil
         turnTask?.cancel()
         turnTask = nil
+        ttsTask?.cancel()
+        ttsTask = nil
+        expectFlushAck = true
         ble.sendCmd("AUDIO_FLUSH")
         tts.stop()
         speech.cancel()
@@ -155,18 +180,21 @@ final class ChatOrchestrator: ObservableObject {
 
     private func startTurn(userText: String) {
         turnTask?.cancel()
+        turnSeq += 1
+        let seq = turnSeq
         turnTask = Task { @MainActor [weak self] in
-            await self?.performTurn(userText: userText)
+            await self?.performTurn(userText: userText, seq: seq)
         }
     }
 
     /* ---------------- 对话轮 ---------------- */
 
-    private func performTurn(userText: String) async {
+    private func performTurn(userText: String, seq: Int) async {
         busy = true
         turnAbort = false
         pendingText = ""
         ttsDiag = ""
+        audioStartAt = nil
         notice = nil
         encoder.reset()
         tts.stop()
@@ -197,6 +225,16 @@ final class ChatOrchestrator: ObservableObject {
                 guard let self, !self.turnAbort else { break }
                 await self.speak(sentence)
             }
+        }
+        ttsTask = ttsJob
+
+        // 语音打断：回复期间麦克风保持开启，检测到人声就停播并转入拾音
+        if ble.isConnected, speechAuthorized {
+            bargeEnabled = true
+            bargeBaselineSum = 0
+            bargeBaselineFrames = 0
+            bargeHit = 0
+            ble.sendCmd("START_MIC")
         }
 
         do {
@@ -243,10 +281,17 @@ final class ChatOrchestrator: ObservableObject {
 
         let firstText = firstDeltaMs < 0 ? "-" : "\(firstDeltaMs)"
         let totalText = Int(Date().timeIntervalSince(started) * 1000)
+        // 只有仍是当前轮次才更新界面状态，避免被打断的旧轮次覆盖新一轮
+        guard turnSeq == seq else { return }
         metrics = "首字 \(firstText)ms | 全轮 \(totalText)ms"
         if !ttsDiag.isEmpty { metrics += " | \(ttsDiag)" }
+        if !turnAbort {
+            bargeEnabled = false
+            ble.sendCmd("STOP_MIC")
+        }
+        ttsTask = nil
         busy = false
-        if !turnAbort { turnTask = nil }
+        turnTask = nil
         refreshPhase()
     }
 
@@ -294,7 +339,8 @@ final class ChatOrchestrator: ObservableObject {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleaned.isEmpty else { return }
 
-        let pcm = await tts.synthesize(cleaned)
+        let raw = await tts.synthesize(cleaned)
+        let pcm = Self.levelPcm(raw)
         guard !pcm.isEmpty else { return }
 
         // 诊断：本轮第一句的开头 0.5s 与整句 RMS，用来区分「是 TTS 源头就轻」
@@ -314,6 +360,7 @@ final class ChatOrchestrator: ObservableObject {
         var offset = 0
         var sent = 0
         var frame = [Int16](repeating: 0, count: BadgeProtocol.frameSamples)
+        if audioStartAt == nil { audioStartAt = Date() }
         while offset < pcm.count {
             if turnAbort || Task.isCancelled { return }
             let n = min(BadgeProtocol.frameSamples, pcm.count - offset)
@@ -321,8 +368,7 @@ final class ChatOrchestrator: ObservableObject {
                 frame[i] = i < n ? pcm[offset + i] : 0    // 尾块补零
             }
             let adpcm = encoder.encode(frame)
-            // 背压：写队列积压超过 200 帧（约 4s）就暂停，宁可晚发也不丢包
-            // —— 之前固定 2 倍速把队列顶满后丢的是最后几帧，尾音就被吞了
+            // 背压一：BLE 写队列积压超过 200 帧（约 4s）就暂停，宁可晚发也不丢包
             var guardCount = 0
             while ble.pendingWrites > 200 && !turnAbort && !Task.isCancelled && guardCount < 200 {
                 try? await Task.sleep(nanoseconds: 20_000_000)
@@ -331,11 +377,145 @@ final class ChatOrchestrator: ObservableObject {
             ble.sendTtsData(adpcm)
             offset += BadgeProtocol.frameSamples
             sent += 1
-            // 预缓冲 40 帧（800ms），之后 17ms/帧（约 1.18 倍速）：
-            // 略快于播放即可建立余量，又不至于把 BLE 写队列顶满
+
+            // 预缓冲 40 帧（800ms），之后按 17ms/帧（约 1.18 倍速）发，
+            // 但已下发未播完的量始终压在 2.4s 内：
+            // 之前一路快发会让挂件 PSRAM 里堆几百 KB 音频块，
+            // 长回复末尾 malloc 失败就整块丢，表现为「最后 1-2 句没读完」
             if sent > 40 {
+                if let start = audioStartAt {
+                    while Double(sent) - Date().timeIntervalSince(start) * 50 > 120
+                        && !turnAbort && !Task.isCancelled {
+                        try? await Task.sleep(nanoseconds: 20_000_000)
+                    }
+                }
                 try? await Task.sleep(nanoseconds: 17_000_000)
             }
+        }
+    }
+
+    /// 逐 100ms 窗的轻量增益归整：把 RMS 往 0.12 靠，最多 3 倍，
+    /// 解决「每条回复开头几个字明显偏轻、慢慢变响」
+    private static func levelPcm(_ input: [Int16]) -> [Int16] {
+        guard input.count > 400 else { return input }
+        var output = [Int16](repeating: 0, count: input.count)
+        let window = 1600                     // 100ms @16k
+        var gain: Float = 1
+        var index = 0
+        while index < input.count {
+            let end = min(index + window, input.count)
+            var energy = 0.0
+            for i in index..<end {
+                let v = Double(input[i]) / 32768.0
+                energy += v * v
+            }
+            let rms = Float((energy / Double(end - index)).squareRoot())
+            if rms > 0.002 {
+                let wanted = min(max(0.12 / rms, 1.0), 3.0)
+                gain = gain * 0.6 + wanted * 0.4
+            }
+            for i in index..<end {
+                let v = Float(input[i]) / 32768.0 * gain
+                output[i] = Int16(clamping: Int(max(-1, min(1, v)) * 32767))
+            }
+            index = end
+        }
+        return output
+    }
+
+    /// 麦克风帧：拾音中喂 ASR（自动拾音时再做尾静音判定），否则做语音打断检测
+    private func handleMicFrame(_ pcm: [Int16]) {
+        if listening {
+            speech.append(pcm)
+            guard autoListen else { return }
+            autoTotalFrames += 1
+            let rms = Self.rms(pcm)
+            if rms > 0.05 {
+                autoSpeechFrames += 1
+                autoSilenceFrames = 0
+            } else if autoSpeechFrames > 10 {
+                autoSilenceFrames += 1
+                if autoSilenceFrames >= 55 { finishAutoListen() }   // 约 1.1s 静音
+            }
+            if autoTotalFrames > 900 { finishAutoListen() }         // 18s 上限
+            return
+        }
+
+        guard bargeEnabled else { return }
+        let rms = Self.rms(pcm)
+        if bargeBaselineFrames < 50 {          // 前 1s 只量喇叭回声底噪
+            bargeBaselineFrames += 1
+            bargeBaselineSum += rms
+            return
+        }
+        let baseline = bargeBaselineSum / Double(bargeBaselineFrames)
+        let threshold = max(0.12, baseline * 1.8)
+        if rms > threshold {
+            bargeHit += 1
+            if bargeHit >= 6 { triggerBargeIn() }   // 约 120ms 持续人声
+        } else {
+            bargeHit = 0
+        }
+    }
+
+    private static func rms(_ pcm: [Int16]) -> Double {
+        guard !pcm.isEmpty else { return 0 }
+        var energy = 0.0
+        for s in pcm {
+            let v = Double(s) / 32768.0
+            energy += v * v
+        }
+        return (energy / Double(pcm.count)).squareRoot()
+    }
+
+    /// 语音打断：停播当前回复，直接复用已开启的麦克风继续拾音
+    private func triggerBargeIn() {
+        guard busy, bargeEnabled else { return }
+        bargeEnabled = false
+        turnAbort = true
+        sentenceSink?.finish()
+        sentenceSink = nil
+        turnTask?.cancel()
+        turnTask = nil
+        ttsTask?.cancel()
+        ttsTask = nil
+        tts.stop()
+        expectFlushAck = true
+        ble.sendCmd("AUDIO_FLUSH")
+
+        if let last = chatLog.indices.last, chatLog[last].role == "assistant" {
+            if chatLog[last].text.isEmpty { chatLog[last].text = "（已打断）" }
+        }
+        busy = false
+        notice = "语音打断"
+        listening = true
+        autoListen = true
+        autoSpeechFrames = 0
+        autoSilenceFrames = 0
+        autoTotalFrames = 0
+        speech.begin()
+        phase = "拾音中…（说完停顿即发送）"
+    }
+
+    private func finishAutoListen() {
+        guard listening, autoListen else { return }
+        listening = false
+        autoListen = false
+        finishingSpeech = true
+        phase = "识别中…"
+        ble.sendCmd("STOP_MIC")
+        Task { @MainActor in
+            let text = await speech.finish()
+            finishingSpeech = false
+            turnAbort = false
+            if text.isEmpty {
+                notice = "未识别到语音"
+                refreshPhase()
+                return
+            }
+            notice = nil
+            chatLog.append(Msg(role: "user", text: text))
+            startTurn(userText: text)
         }
     }
 
@@ -344,6 +524,8 @@ final class ChatOrchestrator: ObservableObject {
     private func handleStatus(_ object: [String: Any]) {
         switch object["ev"] as? String {
         case "tpos":
+            // 我们自己发的 AUDIO_FLUSH 也会回 tpos，别误判成挂件打断
+            if expectFlushAck { expectFlushAck = false; return }
             abortTurn("挂件侧打断")
         case "state":
             if (object["v"] as? String) == "mic_off", listening {
@@ -353,6 +535,9 @@ final class ChatOrchestrator: ObservableObject {
         case "err":
             notice = "设备错误: \(object["msg"] as? String ?? "")"
             refreshPhase()
+        case "ack":
+            // 没在播放时 AUDIO_FLUSH 回的是 ack，顺手清掉等待标记
+            if (object["cmd"] as? String) == "AUDIO_FLUSH" { expectFlushAck = false }
         default:
             break
         }
