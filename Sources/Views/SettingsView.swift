@@ -40,6 +40,17 @@ struct SettingsView: View {
                 }
             }
 
+            Section("语音打断") {
+                Picker("灵敏度", selection: $settings.bargeLevel) {
+                    Text("低（不易误触发）").tag(0)
+                    Text("中（默认）").tag(1)
+                    Text("高（更容易打断）").tag(2)
+                }
+                Text("播报时直接对它说话即可打断；灵敏度越高越容易触发，也越容易被喇叭回声误触。")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("运行状态") {
                 LabeledContent("蓝牙", value: ble.state.rawValue)
                 LabeledContent("MTU", value: "\(ble.mtu)")

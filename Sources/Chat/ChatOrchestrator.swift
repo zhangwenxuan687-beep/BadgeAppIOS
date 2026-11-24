@@ -412,7 +412,8 @@ final class ChatOrchestrator: ObservableObject {
             let rms = Float((energy / Double(end - index)).squareRoot())
             if rms > 0.002 {
                 let wanted = min(max(0.12 / rms, 1.0), 3.0)
-                gain = gain * 0.6 + wanted * 0.4
+                // 第一个窗直接取目标值，否则开头 100ms 还在平滑爬升，等于没抬
+                gain = index == 0 ? wanted : gain * 0.6 + wanted * 0.4
             }
             for i in index..<end {
                 let v = Float(input[i]) / 32768.0 * gain
@@ -449,7 +450,9 @@ final class ChatOrchestrator: ObservableObject {
             return
         }
         let baseline = bargeBaselineSum / Double(bargeBaselineFrames)
-        let threshold = max(0.12, baseline * 1.8)
+        let levels: [Double] = [2.5, 1.8, 1.3]         // 低 / 中 / 高
+        let mult = levels[min(max(SettingsStore.shared.bargeLevel, 0), 2)]
+        let threshold = max(0.12, baseline * mult)
         if rms > threshold {
             bargeHit += 1
             if bargeHit >= 6 { triggerBargeIn() }   // 约 120ms 持续人声
