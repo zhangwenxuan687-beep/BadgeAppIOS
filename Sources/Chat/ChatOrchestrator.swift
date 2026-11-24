@@ -267,6 +267,7 @@ final class ChatOrchestrator: ObservableObject {
         guard !pcm.isEmpty else { return }
 
         var offset = 0
+        var sent = 0
         var frame = [Int16](repeating: 0, count: BadgeProtocol.frameSamples)
         while offset < pcm.count {
             if turnAbort || Task.isCancelled { return }
@@ -277,6 +278,12 @@ final class ChatOrchestrator: ObservableObject {
             let adpcm = encoder.encode(frame)
             ble.sendTtsData(adpcm)
             offset += BadgeProtocol.frameSamples
+            sent += 1
+            // 按播放速率限速：先给前 10 帧（200ms）缓冲，之后 20ms/帧，
+            // 避免合成速度快于蓝牙发送导致写队列积压丢包（挂件播报中途断掉）
+            if sent > 10 {
+                try? await Task.sleep(nanoseconds: 20_000_000)
+            }
         }
     }
 

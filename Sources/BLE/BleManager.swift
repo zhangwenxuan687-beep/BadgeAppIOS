@@ -156,9 +156,9 @@ final class BleManager: NSObject, ObservableObject {
     private func enqueue(_ characteristic: CBCharacteristic, _ data: Data,
                          _ type: CBCharacteristicWriteType) {
         guard state == .connected else { return }
-        if writeQueue.count > 512 {          // 约 10s 音频，积压保护
-            writeQueue.removeFirst()
-            log("写队列溢出，丢最旧包")
+        if writeQueue.count >= 512 {         // 约 10s 音频，积压保护
+            log("写队列溢出，丢弃新包")
+            return
         }
         writeQueue.append(PendingWrite(characteristic: characteristic, data: data, type: type))
         drainWriteQueue()

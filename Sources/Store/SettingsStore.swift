@@ -29,6 +29,6 @@ final class SettingsStore: ObservableObject {
             ?? "http://172.20.10.4:8080/v1/chat/completions"
         model = defaults.string(forKey: Key.model) ?? "qwen3-vl"
         systemPrompt = defaults.string(forKey: Key.systemPrompt)
-            ?? "你是佩戴在用户胸前的AI助手「小星」，回答简短口语化，每次不超过80字，不要用markdown和列表。"
+            ?? "你是佩戴在用户胸前的AI助手「小星」，回答口语化，一般100到200字，不要用markdown和列表。"
     }
 }
