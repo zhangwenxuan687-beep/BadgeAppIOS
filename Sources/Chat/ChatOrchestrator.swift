@@ -190,7 +190,7 @@ final class ChatOrchestrator: ObservableObject {
         // 句子 -> 合成 -> 下发，独立任务串行消费
         var captured: AsyncStream<String>.Continuation!
         let sentences = AsyncStream<String> { captured = $0 }   // 构造闭包同步执行，必定赋值
-        let sink = captured
+        let sink: AsyncStream<String>.Continuation = captured
         sentenceSink = sink
         let ttsJob = Task { @MainActor [weak self] in
             for await sentence in sentences {
